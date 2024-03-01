@@ -2,6 +2,7 @@
 
 # disable suppression
 # shellcheck disable=SC2086
+# shellcheck disable=SC2034
 # shellcheck disable=SC2206
 
 NC='\033[0m'
@@ -9,6 +10,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 PINK='\033[38;5;213m'
 
+# Function to compare two semantic version strings
 compare_versions() {
     IFS='.' read -ra VER1 <<< "$1"
     IFS='.' read -ra VER2 <<< "$2"
@@ -39,7 +41,11 @@ echo ""
 echo -e "Update & Migrate Appwrite Installations easily!"
 echo ""
 
-# Check if Docker daemon is running
+# Declare versions that require migration.
+# NOTE: 1.5x is yet to be released at the time of writing this.
+VERSIONS_THAT_REQUIRE_MIGRATION=("1.3.0" "1.3.4" "1.3.8" "1.4.0" "1.4.2" "1.5.0")
+
+# Check if Docker is running
 if ! docker info &>/dev/null; then
     echo -e "${RED}Error: The Docker daemon is not running. Please start Docker before proceeding."
     echo -e "If you're using Docker Desktop, ensure it's open and running.${NC}"
@@ -47,6 +53,7 @@ if ! docker info &>/dev/null; then
     exit 1
 fi
 
+# Check if `jq` is installed
 if ! command -v jq &> /dev/null; then
     echo -e "${RED}❌ Error: 'jq' is not installed. 'jq' is required for processing JSON data.${NC}"
     echo -e "Please install 'jq' following these instructions: ${GREEN}https://stedolan.github.io/jq/download/${NC}"
@@ -54,7 +61,7 @@ if ! command -v jq &> /dev/null; then
     exit 1
 fi
 
-# Check prerequisites: Appwrite installation and jq
+# Check if appwrite is installed
 if [ ! -f "./appwrite/docker-compose.yml" ]; then
     echo -e "${RED}❌ Appwrite directory not detected in the current directory.${NC}"
     echo ""
@@ -83,13 +90,7 @@ versions=$(curl -s "https://api.github.com/repos/appwrite/appwrite/releases" | \
            sort -Vr)
 
 IFS=$'\n' versions_array=($versions)
-
-# Reverse the order of versions_array in place
-for ((i=0; i<${#versions_array[@]} / 2; i++)); do
-    temp="${versions_array[$i]}"
-    versions_array[$i]="${versions_array[${#versions_array[@]} - 1 - $i]}"
-    versions_array[${#versions_array[@]} - 1 - $i]="$temp"
-done
+unset IFS
 
 echo -e "Available versions for update:"
 for version in "${versions_array[@]}"; do
@@ -123,12 +124,45 @@ if ! $version_found; then
     exit 1
 fi
 
+
+optimized_versions=()
+
+for version in "${versions_array[@]}"; do
+    compare_versions "$version" "$current_version"
+    result_with_current=$?
+
+    compare_versions "$version" "$latest_version"
+    result_with_latest=$?
+
+    if [[ "$version" == "$selected_version" ]]; then
+        optimized_versions+=("$version")
+    fi
+
+    if [[ $result_with_current -eq 1 && ( $result_with_latest -eq 2 || $result_with_latest -eq 0 ) ]]; then
+        for migration_version in "${VERSIONS_THAT_REQUIRE_MIGRATION[@]}"; do
+            if [[ "$version" == "$migration_version" ]]; then
+                optimized_versions+=("$version")
+                break
+            fi
+        done
+    fi
+
+done
+
+
+# Reverse the order of optimized_versions in place
+for ((i=0; i<${#optimized_versions[@]} / 2; i++)); do
+    temp="${optimized_versions[$i]}"
+    optimized_versions[$i]="${optimized_versions[${#optimized_versions[@]} - 1 - $i]}"
+    optimized_versions[${#optimized_versions[@]} - 1 - $i]="$temp"
+done
+
 echo -e "${GREEN}Preparing Update${NC}"
 echo ""
 
 previous_version=$current_version
 
-for version in "${versions_array[@]}"; do
+for version in "${optimized_versions[@]}"; do
     compare_versions "$version" "$current_version"
     comparison_result=$?
 
@@ -140,16 +174,23 @@ for version in "${versions_array[@]}"; do
     echo -e "${GREEN}##################################################${NC}"
     echo -e "  └── Pulling image: $version..."
 
+    # Once `no-start` is supported,
+    # we can simply pass that flag after `$version` and remove our echo Y piping.
     if echo Y | docker run -i --rm \
         --volume /var/run/docker.sock:/var/run/docker.sock \
         --volume "$(pwd)/appwrite:/usr/src/code/appwrite:rw" \
         --entrypoint="upgrade" \
         appwrite/appwrite:$version > /dev/null 2>&1; then
-        echo -e "  └── Image successfully pulled."
+        echo -e "  └── Image successfully installed."
 
-        echo -e "  └── Attempting version change migration..."
-        (cd appwrite/ && docker compose exec appwrite migrate > /dev/null 2>&1)
-        echo -e "  └── Migration completed successfully."
+        for migration_version in "${VERSIONS_THAT_REQUIRE_MIGRATION[@]}"; do
+            if [[ "$version" == "$migration_version" ]]; then
+                echo "  └── Migration is required for version: $version."
+                echo "  └── Attempting migration..."
+                (cd appwrite/ && docker compose exec appwrite migrate > /dev/null 2>&1)
+                echo "  └── Migration completed successfully."
+            fi
+        done
 
         # remove previous version image
         echo -e "  └── Removing old image ($previous_version)"
