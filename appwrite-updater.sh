@@ -43,7 +43,7 @@ echo ""
 
 # Declare versions that require migration.
 # NOTE: 1.5x is yet to be released at the time of writing this.
-VERSIONS_THAT_REQUIRE_MIGRATION=("1.3.0" "1.3.4" "1.3.8" "1.4.0" "1.4.2" "1.5.0")
+VERSIONS_THAT_REQUIRE_MIGRATION=("1.3.0" "1.3.4" "1.3.8" "1.4.0" "1.4.2" "1.4.14" "1.5.0")
 
 # Check if Docker is running
 if ! docker info &>/dev/null; then
