@@ -8,6 +8,7 @@
 NC='\033[0m'
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
 PINK='\033[38;5;213m'
 
 # Function to compare two semantic version strings
@@ -42,8 +43,7 @@ echo -e "Update & Migrate Appwrite Installations easily!"
 echo ""
 
 # Declare versions that require migration.
-# NOTE: 1.5x is yet to be released at the time of writing this.
-VERSIONS_THAT_REQUIRE_MIGRATION=("1.3.0" "1.3.4" "1.3.8" "1.4.0" "1.4.2" "1.4.14" "1.5.0")
+VERSIONS_THAT_REQUIRE_MIGRATION=("1.3.0" "1.3.4" "1.3.8" "1.4.0" "1.4.2" "1.4.14" "1.5.1")
 
 # Check if Docker is running
 if ! docker info &>/dev/null; then
@@ -95,7 +95,19 @@ unset IFS
 echo -e "Available versions for update:"
 for version in "${versions_array[@]}"; do
     if [ "$(printf '%s\n' "$version" "$current_version" | sort -V | head -n1)" = "$current_version" ] && [ "$version" != "$current_version" ]; then
-        echo -e "  - ${GREEN}$version${NC}"
+        requires_migration="false"
+
+        for migration_version in "${VERSIONS_THAT_REQUIRE_MIGRATION[@]}"; do
+          if [[ "$version" == "$migration_version" ]]; then
+            requires_migration="true"
+          fi
+        done
+
+        if [[ "$requires_migration" == "true" ]]; then
+          echo -e "${GREEN}➤ $version${NC} (${YELLOW}Migration required${NC})"
+        else
+          echo -e "${GREEN}➤ $version${NC}"
+        fi
     fi
 done
 
@@ -174,8 +186,6 @@ for version in "${optimized_versions[@]}"; do
     echo -e "${GREEN}##################################################${NC}"
     echo -e "  └── Pulling image: $version..."
 
-    # Once `no-start` is supported,
-    # we can simply pass that flag after `$version` and remove our echo Y piping.
     if echo Y | docker run -i --rm \
         --volume /var/run/docker.sock:/var/run/docker.sock \
         --volume "$(pwd)/appwrite:/usr/src/code/appwrite:rw" \
@@ -187,7 +197,7 @@ for version in "${optimized_versions[@]}"; do
             if [[ "$version" == "$migration_version" ]]; then
                 echo "  └── Migration is required for version: $version."
                 echo "  └── Attempting migration..."
-                (cd appwrite/ && docker compose exec appwrite migrate > /dev/null 2>&1)
+                cd appwrite/ && docker compose exec appwrite migrate > /dev/null 2>&1 && cd ../
                 echo "  └── Migration completed successfully."
             fi
         done
@@ -211,7 +221,7 @@ for version in "${optimized_versions[@]}"; do
         echo -e "${GREEN}Reached target version $selected_version.${NC}"
         echo ""
         echo "Restarting appwrite instance..."
-        (cd appwrite/ && docker compose restart > /dev/null 2>&1)
+        cd appwrite/ && docker compose restart > /dev/null 2>&1 && cd ../
         echo "Appwrite restarted successfully!"
         echo ""
 
