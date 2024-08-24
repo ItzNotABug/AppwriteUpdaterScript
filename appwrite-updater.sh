@@ -43,7 +43,7 @@ echo -e "Update & Migrate Appwrite Installations easily!"
 echo ""
 
 # Declare versions that require migration.
-VERSIONS_THAT_REQUIRE_MIGRATION=("1.3.0" "1.3.4" "1.3.8" "1.4.0" "1.4.2" "1.4.14" "1.5.1", "1.5.5")
+VERSIONS_THAT_REQUIRE_MIGRATION=("1.3.0" "1.3.4" "1.3.8" "1.4.0" "1.4.2" "1.4.14" "1.5.1", "1.5.5", "1.5.10")
 
 # Check if Docker is running
 if ! docker info &>/dev/null; then
