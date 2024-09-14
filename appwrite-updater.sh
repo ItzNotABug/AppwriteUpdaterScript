@@ -10,6 +10,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 PINK='\033[38;5;213m'
+VERSIONS_JSON_URL="https://raw.githubusercontent.com/ItzNotABug/AppwriteUpdaterScript/master/versions.json"
 
 # Function to compare two semantic version strings
 compare_versions() {
@@ -42,9 +43,6 @@ echo ""
 echo -e "Update & Migrate Appwrite Installations easily!"
 echo ""
 
-# Declare versions that require migration.
-VERSIONS_THAT_REQUIRE_MIGRATION=("1.3.0" "1.3.4" "1.3.8" "1.4.0" "1.4.2" "1.4.14" "1.5.1", "1.5.5", "1.5.10")
-
 # Check if Docker is running
 if ! docker info &>/dev/null; then
     echo -e "${RED}Error: The Docker daemon is not running. Please start Docker before proceeding."
@@ -67,6 +65,11 @@ if [ ! -f "./appwrite/docker-compose.yml" ]; then
     echo ""
     exit 1
 fi
+
+
+# shellcheck disable=SC2207
+# Fetch the list of versions that require migration
+VERSIONS_THAT_REQUIRE_MIGRATION=($(curl -s $VERSIONS_JSON_URL | jq -r '.versions[]'))
 
 # Extract the current Appwrite version
 current_version=$(sed -n 's/.*appwrite\/appwrite:\([^ ]*\).*/\1/p' ./appwrite/docker-compose.yml | head -n 1)
@@ -220,10 +223,14 @@ for version in "${optimized_versions[@]}"; do
         echo ""
         echo -e "${GREEN}Reached target version $selected_version.${NC}"
         echo ""
-        echo "Restarting appwrite instance..."
-        cd appwrite/ && docker compose restart > /dev/null 2>&1 && cd ../
-        echo "Appwrite restarted successfully!"
-        echo ""
+
+        # Don't restart if migrating only one version.
+        if [[ ${#optimized_versions[@]} -gt 1 ]]; then
+          echo "Restarting appwrite instance..."
+          cd appwrite/ && docker compose restart > /dev/null 2>&1 && cd ../
+          echo "Appwrite restarted successfully!"
+          echo ""
+        fi
 
         break
     fi
