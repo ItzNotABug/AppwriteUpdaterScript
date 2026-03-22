@@ -78,3 +78,13 @@ Details:
 - This script is independently maintained and not an official Appwrite product.
 - `versions.json` is part of the execution model. Keep it aligned with real Appwrite migration boundaries.
 - Always take a backup before running upgrades on a real instance.
+
+## Docker Compatibility
+
+Older Docker Engine / API versions can break newer Appwrite updates.
+
+This usually shows up through Traefik or Appwrite runtime orchestration (`openruntimes` / `executor`) hitting Docker
+API compatibility limits.
+
+For newer Appwrite versions, keep the host Docker version current. This script does not manage Docker upgrades, and
+these failures do not imply data loss.
