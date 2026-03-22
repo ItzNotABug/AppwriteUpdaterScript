@@ -701,8 +701,25 @@ init_log_file() {
     if : > "$log_candidate" 2>/dev/null; then
         LOG_FILE="$log_candidate"
     else
-        LOG_FILE="$(mktemp -t appwrite-updater.log)"
+        LOG_FILE="$(make_temp_file "appwrite-updater-log")"
     fi
+}
+
+make_temp_file() {
+    local prefix="$1"
+    local suffix="${2:-}"
+    local tmpdir path final_path
+
+    tmpdir="${TMPDIR:-/tmp}"
+    path="$(mktemp "${tmpdir%/}/${prefix}.XXXXXX")"
+
+    if [ -n "$suffix" ]; then
+        final_path="${path}${suffix}"
+        mv "$path" "$final_path"
+        path="$final_path"
+    fi
+
+    echo "$path"
 }
 
 render_spinner_line() {
@@ -887,7 +904,7 @@ run_command() {
     shift
 
     local output_file
-    output_file="$(mktemp -t appwrite-updater-command.log)"
+    output_file="$(make_temp_file "appwrite-updater-command-log")"
 
     local status=0
     run_with_spinner_capture "$description" "$output_file" "$@" || status=$?
@@ -911,7 +928,7 @@ migration_output_has_errors() {
 run_migration_command() {
     local version="$1"
     local output_file
-    output_file="$(mktemp -t appwrite-updater-migrate.log)"
+    output_file="$(make_temp_file "appwrite-updater-migrate-log")"
 
     local description="Running migration for ${version}"
     local status=0
@@ -1163,7 +1180,7 @@ collect_release_versions_to_file() {
     local page_count tag
     local fetched=()
     local body_file
-    body_file="$(mktemp -t appwrite-updater-releases-body)"
+    body_file="$(make_temp_file "appwrite-updater-releases-body")"
 
     while true; do
         : > "$headers_file"
@@ -1194,9 +1211,9 @@ collect_release_versions_to_file() {
 
 fetch_release_versions() {
     local data_file capture_file headers_file
-    data_file="$(mktemp -t appwrite-updater-releases.data)"
-    capture_file="$(mktemp -t appwrite-updater-releases.log)"
-    headers_file="$(mktemp -t appwrite-updater-releases.headers)"
+    data_file="$(make_temp_file "appwrite-updater-releases-data")"
+    capture_file="$(make_temp_file "appwrite-updater-releases-log")"
+    headers_file="$(make_temp_file "appwrite-updater-releases-headers")"
 
     local description='Fetching Appwrite releases'
     local status=0
@@ -1695,7 +1712,7 @@ runtime_patch_plan_status() {
 preflight_16x_sync_iterator_runtime_patch() {
     local expected_version="$1"
     local temp_script
-    temp_script="$(mktemp -t appwrite-updater-16x-preflight.XXXXXX.php)"
+    temp_script="$(make_temp_file "appwrite-updater-16x-preflight" ".php")"
 
     cat > "$temp_script" <<PHP
 <?php
@@ -1808,7 +1825,7 @@ PHP
 
 patch_16x_sync_iterator_runtime() {
     local temp_script
-    temp_script="$(mktemp -t appwrite-updater-16x-patch.XXXXXX.php)"
+    temp_script="$(make_temp_file "appwrite-updater-16x-patch" ".php")"
 
     cat > "$temp_script" <<PHP
 <?php
@@ -1903,7 +1920,7 @@ PHP
 
 verify_16x_sync_iterator_runtime_patch() {
     local temp_script
-    temp_script="$(mktemp -t appwrite-updater-16x-verify.XXXXXX.php)"
+    temp_script="$(make_temp_file "appwrite-updater-16x-verify" ".php")"
 
     cat > "$temp_script" <<'PHP'
 <?php
