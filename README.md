@@ -1,53 +1,80 @@
-# Appwrite Updater Script 🚀
+# Appwrite Updater Script
 
-Update & Migrate your Appwrite instance sequentially with a small script 🌟!
+Migration-aware upgrades for self-hosted Appwrite.
 
-### Features 🌈
+## Overview
 
-- **Updates**: Fetch and apply the latest Appwrite version seamlessly.
-- **Version Selection**: Choose a specific version to update to, with a default to the latest.
-- **Sequential Version Migration**: If you select a version several releases ahead, the script updates version by version, ensuring proper migration of the internal dataset
-  and databases for each incremental update.
-- **Migration Management**: Run migrations post-update.
-- **Space Cleanup**: Remove previous Docker image to free up space.
+- Plans upgrades boundary by boundary instead of guessing across multiple Appwrite minors.
+- Runs `upgrade`, readiness checks, and `migrate --version=...` in sequence for each planned step.
+- Supports dry-run planning, explicit targets, and non-default Appwrite directories.
+- Stops on migration error markers instead of reporting a false success.
+- Applies the temporary `1.6.x` runtime patch automatically when that migration step is part of the plan.
 
-### Prerequisites 🛠️
+## Requirements
 
 - Docker / Docker Desktop
-- `jq` for JSON processing
+- `curl`
+- `jq`
+- An Appwrite directory containing `docker-compose.yml`
 
-### Quick Start 🚀
+## Usage
 
-1. **Navigate to the correct folder**:\
-   Navigate to where your `appwrite` folder is.
-   Directory structure is same as `appwrite` requires -
+```bash
+./appwrite-updater.sh [options]
+```
 
-   ```text
-   parent_directory <= you run the commands in this directory
-   └── appwrite
-       └── docker-compose.yml
-   ```
+Options:
 
-2. **Get the script**:
-   ```bash
-   curl -o appwrite-updater.sh https://raw.githubusercontent.com/ItzNotABug/AppwriteUpdaterScript/master/appwrite-updater.sh && chmod +x appwrite-updater.sh
-   ```
+- `-v, --version <ver>`: target Appwrite version
+- `-d, --appwrite-dir <dir>`: path to the Appwrite installation
+- `--dry-run`: preview the plan without applying changes
+- `-y, --yes`: skip the confirmation prompt
+- `--no-cleanup`: keep previous Appwrite images
+- `--no-restart`: skip the final `docker compose restart`
+- `--verbose`: stream Docker/Appwrite output to the terminal
+- `-h, --help`: show help
 
-3. **Run the Script**:
-   ```bash
-   ./appwrite-updater.sh
-   ```
+## Examples
 
-   Follow the prompts to select the version you wish to update to. If no input is provided, the script defaults to the latest version.
+```bash
+# Preview the upgrade path
+./appwrite-updater.sh --dry-run
 
-### Contributing 🤝
+# Preview a specific target
+./appwrite-updater.sh --dry-run --version 1.8.1
 
-Contributions are welcome! Feel free to fork, improve, and submit a pull request.
+# Use a non-default Appwrite directory
+./appwrite-updater.sh --appwrite-dir /path/to/appwrite
 
-### Disclaimer ⚠️
+# Run without confirmation and keep old images
+./appwrite-updater.sh --yes --no-cleanup
+```
 
-This script is independently maintained and not an official appwrite product. Use at your own risk.
+## How It Works
 
----
+1. Detects the current Appwrite image tag from `docker compose config --images`, with a compose-file fallback.
+2. Loads migration boundaries from `versions.json`.
+3. Uses `versions.json` to build dry-run previews, or fetches stable Appwrite releases from GitHub for live target
+   selection when `--version` is omitted.
+4. Builds a sequential upgrade plan across known boundaries only.
+5. For each step it:
+    - runs Appwrite `upgrade`
+    - waits for the Appwrite container to become ready
+    - verifies the running Appwrite version
+    - runs `migrate --version=<step-version>` when the step crosses a migration boundary
+6. Optionally restarts services and removes old Appwrite images after the full run completes.
 
-**Note: The script is tested on a Mac system only.**
+## 1.6.x Runtime Patch
+
+If the plan crosses Appwrite `1.6.x`, the updater temporarily patches Appwrite’s migration runtime before running that
+migration step and restores the original file after a successful migration.
+
+Details:
+
+- `RUNTIME-PATCH.md`
+
+## Notes
+
+- This script is independently maintained and not an official Appwrite product.
+- `versions.json` is part of the execution model. Keep it aligned with real Appwrite migration boundaries.
+- Always take a backup before running upgrades on a real instance.
