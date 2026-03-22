@@ -17,6 +17,14 @@ Migration-aware upgrades for self-hosted Appwrite.
 - `jq`
 - An Appwrite directory containing `docker-compose.yml`
 
+## Get the Script
+
+Run this from the parent directory that contains your `appwrite/` folder:
+
+```bash
+curl -o appwrite-updater.sh https://raw.githubusercontent.com/ItzNotABug/AppwriteUpdaterScript/master/appwrite-updater.sh && chmod +x appwrite-updater.sh
+```
+
 ## Usage
 
 ```bash
