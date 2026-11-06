@@ -45,6 +45,11 @@ MIGRATION_RUNTIME_BACKUP_PATH='/usr/src/code/src/Appwrite/Migration/Migration.ph
 ACTIVE_COMMAND_PID=''
 ACTIVE_COMMAND_DESCRIPTION=''
 TREE_PREFIX=''
+PUBLISHED_HTTP_PORT=''
+PUBLISHED_HTTPS_PORT=''
+PENDING_MIGRATION=''
+LATEST_KNOWN_VERSION=''
+MIGRATION_RUNNING=false
 
 RELEASE_VERSIONS=()
 MIGRATION_BOUNDARIES=()
@@ -493,8 +498,8 @@ Usage:
   ./appwrite-updater.sh [options]
 
 Options:
-  -v, --version <ver>      Target version (default: latest stable)
-  -d, --appwrite-dir <dir> Appwrite directory (default: ./appwrite)
+  -v, --version <ver>      Target version (default: newest stable release this updater supports)
+  -d, --appwrite-dir <dir> Appwrite directory, in a folder named appwrite (default: ./appwrite)
       --dry-run            Preview the plan without making changes
   -y, --yes                Skip confirmation prompts
       --no-cleanup         Keep previous Appwrite images
@@ -553,6 +558,10 @@ normalize_version() {
     local version="$1"
     version="${version#v}"
     echo "$version"
+}
+
+is_stable_version() {
+    [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
 expand_path() {
@@ -678,16 +687,6 @@ contains_normalized_value() {
     return 1
 }
 
-is_boundary_minor() {
-    local boundary
-    for boundary in "${MIGRATION_BOUNDARIES[@]}"; do
-        if version_eq "$boundary" "$1"; then
-            return 0
-        fi
-    done
-    return 1
-}
-
 init_log_file() {
     if [ "$DRY_RUN" = true ]; then
         LOG_FILE=""
@@ -729,6 +728,19 @@ render_spinner_line() {
     clear_line
 }
 
+# A pipeline waits for tee, so the output file is complete when this returns.
+# A tee failure must not replace the status of the command itself.
+stream_command_output() {
+    local output_file="$1"
+    shift
+
+    if [ -n "${LOG_FILE:-}" ]; then
+        "$@" 2>&1 | { tee -a "$LOG_FILE" "$output_file" || true; }
+    else
+        "$@" 2>&1 | { tee "$output_file" || true; }
+    fi
+}
+
 run_with_spinner_capture() {
     local description="$1"
     local output_file
@@ -747,11 +759,7 @@ run_with_spinner_capture() {
         else
             step "$description"
         fi
-        if [ -n "${LOG_FILE:-}" ]; then
-            "$@" > >(tee -a "$LOG_FILE" "$output_file") 2> >(tee -a "$LOG_FILE" "$output_file" >&2) || status=$?
-        else
-            "$@" > >(tee "$output_file") 2> >(tee "$output_file" >&2) || status=$?
-        fi
+        stream_command_output "$output_file" "$@" || status=$?
     else
         local spinner_index=0
         local pid
@@ -838,11 +846,7 @@ run_with_tree_spinner_capture() {
 
     if [ "$VERBOSE" = true ]; then
         tree_line "$description"
-        if [ -n "${LOG_FILE:-}" ]; then
-            "$@" > >(tee -a "$LOG_FILE" "$output_file") 2> >(tee -a "$LOG_FILE" "$output_file" >&2) || status=$?
-        else
-            "$@" > >(tee "$output_file") 2> >(tee "$output_file" >&2) || status=$?
-        fi
+        stream_command_output "$output_file" "$@" || status=$?
     else
         local spinner_index=0
         local pid
@@ -925,6 +929,47 @@ migration_output_has_errors() {
     grep -Eq 'Failed to update project|Failed to migrate project|Fatal error:|SQLSTATE\[|^\[Error\]|Collection not found|No migration found for version' "$file"
 }
 
+# The Appwrite folder is often root-owned, so this lives in the user's home, one file per installation.
+pending_migration_file() {
+    local home=~
+    local install_dir
+    install_dir="$(cd "$APPWRITE_DIR" && pwd -P)"
+
+    printf '%s/.appwrite-updater/pending-migration%s' "$home" "$(printf '%s' "$install_dir" | tr '/' '_')"
+}
+
+load_pending_migration() {
+    local file
+    file="$(pending_migration_file)"
+
+    if [ -f "$file" ] && [ "$(<"$file")" = "$CURRENT_VERSION" ]; then
+        PENDING_MIGRATION="$CURRENT_VERSION"
+    fi
+}
+
+# The compose file moves to a new version before its migration runs, so a failed or interrupted
+# step would look finished on the next run. Each migration only runs its own changes, so record it.
+record_pending_migration() {
+    local file
+    file="$(pending_migration_file)"
+
+    if ! { mkdir -p "$(dirname "$file")" && printf '%s\n' "$1" > "$file"; } 2>/dev/null; then
+        error "Could not write ${file}"
+        subtle "Without it, a failed ${1} migration would be skipped on the next run. Make this location writable, then run this again."
+        exit 1
+    fi
+}
+
+clear_pending_migration() {
+    rm -f "$(pending_migration_file)"
+}
+
+# An interrupted `migrate` keeps running inside the container, so restart it before retrying.
+stop_interrupted_migration() {
+    run_command "Stopping any interrupted migration" docker compose --project-directory "$APPWRITE_DIR" restart appwrite ||
+        warn "Could not restart Appwrite. Continuing with the retry."
+}
+
 run_migration_command() {
     local version="$1"
     local output_file
@@ -933,10 +978,12 @@ run_migration_command() {
     local description="Running migration for ${version}"
     local status=0
 
+    MIGRATION_RUNNING=true
     run_with_spinner_capture \
         "$description" \
         "$output_file" \
         docker compose --project-directory "$APPWRITE_DIR" exec -T appwrite migrate "--version=${version}" || status=$?
+    MIGRATION_RUNNING=false
 
     if [ "$status" -ne 0 ] || migration_output_has_errors "$output_file"; then
         error "Migration failed for ${version}"
@@ -944,6 +991,8 @@ run_migration_command() {
         log_failure_summary_from_output "$output_file"
         show_failure_output "$output_file"
         cleanup_temp_file "$output_file"
+        subtle "Fix the cause and run this again: it retries this migration before moving on."
+        subtle "If you checked the data and it is fine, delete $(pending_migration_file) to skip the retry."
         return 1
     fi
 
@@ -1011,9 +1060,11 @@ wait_for_appwrite_ready() {
 
 get_running_appwrite_version() {
     docker compose --project-directory "$APPWRITE_DIR" exec -T appwrite php -r '
-        $constants = @file_get_contents("/usr/src/code/app/init/constants.php");
+        // The version constant moved from app/init.php to app/init/constants.php in 1.6.2.
+        $file = "/usr/src/code/app/init/constants.php";
+        $constants = @file_get_contents(is_file($file) ? $file : "/usr/src/code/app/init.php");
         if (!is_string($constants) || $constants === "") {
-            fwrite(STDERR, "Failed to read constants.php\n");
+            fwrite(STDERR, "Failed to read the Appwrite version constant\n");
             exit(1);
         }
 
@@ -1145,10 +1196,13 @@ load_migration_boundaries() {
 
     while IFS= read -r version; do
         [ -n "$version" ] && MIGRATION_BOUNDARIES+=("$(normalize_version "$version")")
-    done < <(printf '%s' "$versions_json_content" | jq -r '.versions[]')
+    done < <(printf '%s' "$versions_json_content" | jq -r '(.boundaries // [])[]')
 
-    if [ "${#MIGRATION_BOUNDARIES[@]}" -eq 0 ]; then
+    LATEST_KNOWN_VERSION="$(printf '%s' "$versions_json_content" | jq -r '.latest // empty' || true)"
+
+    if [ "${#MIGRATION_BOUNDARIES[@]}" -eq 0 ] || [ -z "$LATEST_KNOWN_VERSION" ]; then
         error "No migration boundaries were found in versions.json"
+        subtle "Update versions.json together with this script, or remove the local copy to use the published one."
         exit 1
     fi
 }
@@ -1291,7 +1345,36 @@ get_current_version() {
         exit 1
     fi
 
+    if ! is_stable_version "$detected"; then
+        error "Unsupported Appwrite image tag: ${detected}"
+        subtle "Pin a stable X.Y.Z release first. Nightly and pre-release tags cannot be planned."
+        exit 1
+    fi
+
     CURRENT_VERSION="$detected"
+}
+
+# Appwrite's upgrade runs compose from a folder named appwrite and drops COMPOSE_PROJECT_NAME from .env.
+check_compose_project_name() {
+    local folder project
+    folder="$(basename "$APPWRITE_DIR" | tr '[:upper:]' '[:lower:]')"
+    project="$(docker compose --project-directory "$APPWRITE_DIR" config --format json 2>/dev/null | jq -r '.name // empty' 2>/dev/null || true)"
+
+    if [ "$folder" = 'appwrite' ] && { [ -z "$project" ] || [ "$project" = 'appwrite' ]; }; then
+        return 0
+    fi
+
+    local problem="Appwrite's upgrade needs a folder and compose project named appwrite (found folder ${folder}, project ${project:-unknown})"
+    if [ "$DRY_RUN" = true ]; then
+        warn "$problem"
+    else
+        error "$problem"
+    fi
+    subtle "Do not just rename a live folder: compose would point it at new, empty volumes. Copy the existing volumes to appwrite_* first."
+
+    if [ "$DRY_RUN" = false ]; then
+        exit 1
+    fi
 }
 
 select_target_version() {
@@ -1299,6 +1382,7 @@ select_target_version() {
     local newer_versions=()
     local source_versions=()
     local index=1
+    local skipped_versions=0
     local default_target
     local -a card_lines=()
 
@@ -1310,16 +1394,28 @@ select_target_version() {
     if [ "$DRY_RUN" = true ]; then
         while IFS= read -r version; do
             [ -n "$version" ] && source_versions+=("$version")
-        done < <(sort_versions_desc "${MIGRATION_BOUNDARIES[@]}")
+        done < <(sort_versions_desc "${MIGRATION_BOUNDARIES[@]}" "$LATEST_KNOWN_VERSION")
     else
         source_versions=("${RELEASE_VERSIONS[@]}")
     fi
 
     for version in "${source_versions[@]}"; do
-        if version_gt "$version" "$CURRENT_VERSION"; then
-            newer_versions+=("$version")
+        if ! version_gt "$version" "$CURRENT_VERSION" || target_is_unsafe_from_1x "$version"; then
+            continue
         fi
+
+        if target_is_beyond_latest_known "$version"; then
+            skipped_versions=$((skipped_versions + 1))
+            continue
+        fi
+
+        newer_versions+=("$version")
     done
+
+    if [ "$skipped_versions" -gt 0 ]; then
+        warn "Ignoring ${skipped_versions} newer release(s) beyond the latest known version (${LATEST_KNOWN_VERSION})"
+        subtle "Refresh versions.json to plan them."
+    fi
 
     if [ "${#newer_versions[@]}" -eq 0 ]; then
         RESOLVED_TARGET_VERSION="$CURRENT_VERSION"
@@ -1334,11 +1430,11 @@ select_target_version() {
     fi
 
     for version in "${newer_versions[@]}"; do
-        if [ "$version" = "$default_target" ] && is_boundary_minor "$version"; then
+        if [ "$version" = "$default_target" ] && step_requires_migration "$CURRENT_VERSION" "$version"; then
             card_lines+=("  ${index}. ${GREEN}${BOLD}${version}${NC}  $(badge success 'recommended') $(badge warn 'migration')")
         elif [ "$version" = "$default_target" ]; then
             card_lines+=("  ${index}. ${GREEN}${BOLD}${version}${NC}  $(badge success 'recommended')")
-        elif is_boundary_minor "$version"; then
+        elif step_requires_migration "$CURRENT_VERSION" "$version"; then
             card_lines+=("  ${index}. ${GREEN}${BOLD}${version}${NC}  $(badge warn 'migration')")
         else
             card_lines+=("  ${index}. ${SOFT}${version}${NC}")
@@ -1365,8 +1461,24 @@ select_target_version() {
 }
 
 # ---------- Plan building / confirmation ----------
+target_is_beyond_latest_known() {
+    version_gt "$1" "$LATEST_KNOWN_VERSION" && [ "$(major_minor "$1")" != "$(major_minor "$LATEST_KNOWN_VERSION")" ]
+}
+
+plan_crosses_into_2x() {
+    version_lt "$CURRENT_VERSION" '2.0.0' && ! version_lt "$RESOLVED_TARGET_VERSION" '2.0.0'
+}
+
+# 2.2.0 fixed a MariaDB healthcheck that made upgrades from 1.x fail to start containers.
+target_is_unsafe_from_1x() {
+    version_lt "$CURRENT_VERSION" '2.0.0' && ! version_lt "$1" '2.0.0' && version_lt "$1" '2.2.0'
+}
+
 validate_target_version() {
-    local latest_known_boundary="${MIGRATION_BOUNDARIES[${#MIGRATION_BOUNDARIES[@]} - 1]}"
+    if ! is_stable_version "$RESOLVED_TARGET_VERSION"; then
+        error "Target version ${RESOLVED_TARGET_VERSION} is not a stable X.Y.Z release"
+        exit 1
+    fi
 
     if version_lt "$RESOLVED_TARGET_VERSION" "$CURRENT_VERSION"; then
         error "Target version ${RESOLVED_TARGET_VERSION} is older than current version ${CURRENT_VERSION}"
@@ -1374,7 +1486,7 @@ validate_target_version() {
     fi
 
     if version_eq "$RESOLVED_TARGET_VERSION" "$CURRENT_VERSION"; then
-        if [ "$DRY_RUN" = true ]; then
+        if [ "$DRY_RUN" = true ] || [ -n "$PENDING_MIGRATION" ]; then
             return 0
         fi
         success "Already on the selected version (${CURRENT_VERSION})"
@@ -1386,25 +1498,57 @@ validate_target_version() {
         exit 1
     fi
 
-    if version_gt "$RESOLVED_TARGET_VERSION" "$latest_known_boundary" && \
-        [ "$(major_minor "$RESOLVED_TARGET_VERSION")" != "$(major_minor "$latest_known_boundary")" ]; then
-        error "Target version ${RESOLVED_TARGET_VERSION} is beyond the latest known migration boundary (${latest_known_boundary})"
+    if target_is_beyond_latest_known "$RESOLVED_TARGET_VERSION"; then
+        error "Target version ${RESOLVED_TARGET_VERSION} is beyond the latest known version (${LATEST_KNOWN_VERSION})"
         subtle "Refresh versions.json before attempting this upgrade."
+        exit 1
+    fi
+
+    if target_is_unsafe_from_1x "$RESOLVED_TARGET_VERSION"; then
+        error "Target version ${RESOLVED_TARGET_VERSION} is not a safe upgrade from 1.x"
+        subtle "Upgrades from 1.x to 2.0.x or 2.1.x can fail to start containers. Choose 2.2.0 or newer."
         exit 1
     fi
 }
 
+step_requires_migration() {
+    local from="$1"
+    local to="$2"
+    local boundary
+
+    # 1.9.6 added a migration class in a patch release and 2.x keeps growing it, so from 1.9.0 on
+    # every step runs `migrate`, as upstream's release notes ask.
+    if [ "$(major_minor "$from")" != "$(major_minor "$to")" ] || ! version_lt "$to" '1.9.0'; then
+        return 0
+    fi
+
+    # A patch hop within an older minor only migrates when it reaches a known boundary.
+    for boundary in "${MIGRATION_BOUNDARIES[@]}"; do
+        if version_gt "$boundary" "$from" && ! version_gt "$boundary" "$to"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 build_plan() {
     local boundary
-    local current_minor target_minor
-
-    current_minor="$(major_minor "$CURRENT_VERSION")"
-    target_minor="$(major_minor "$RESOLVED_TARGET_VERSION")"
 
     PLAN_VERSIONS=()
     PLAN_MIGRATIONS=()
 
+    if [ -n "$PENDING_MIGRATION" ]; then
+        PLAN_VERSIONS+=("$PENDING_MIGRATION")
+        PLAN_MIGRATIONS+=("yes")
+    fi
+
     for boundary in "${MIGRATION_BOUNDARIES[@]}"; do
+        # 1.9 stops only move older instances onto the migration class that 2.x shares from 1.9.6.
+        if [ "$(major_minor "$boundary")" = '1.9' ] && ! version_lt "$CURRENT_VERSION" '1.9.6'; then
+            continue
+        fi
+
         if version_gt "$boundary" "$CURRENT_VERSION" && version_lt "$boundary" "$RESOLVED_TARGET_VERSION"; then
             PLAN_VERSIONS+=("$boundary")
             PLAN_MIGRATIONS+=("yes")
@@ -1412,14 +1556,10 @@ build_plan() {
     done
 
     if version_gt "$RESOLVED_TARGET_VERSION" "$CURRENT_VERSION"; then
-        if [ "$current_minor" != "$target_minor" ] && is_boundary_minor "$RESOLVED_TARGET_VERSION"; then
-            PLAN_VERSIONS+=("$RESOLVED_TARGET_VERSION")
-            PLAN_MIGRATIONS+=("yes")
-        elif [ "$current_minor" != "$target_minor" ] && ! is_boundary_minor "$RESOLVED_TARGET_VERSION"; then
-            PLAN_VERSIONS+=("$RESOLVED_TARGET_VERSION")
+        PLAN_VERSIONS+=("$RESOLVED_TARGET_VERSION")
+        if step_requires_migration "$CURRENT_VERSION" "$RESOLVED_TARGET_VERSION"; then
             PLAN_MIGRATIONS+=("yes")
         else
-            PLAN_VERSIONS+=("$RESOLVED_TARGET_VERSION")
             PLAN_MIGRATIONS+=("no")
         fi
     fi
@@ -1462,7 +1602,16 @@ print_plan() {
 }
 
 confirm_execution() {
-    if [ "$ASSUME_YES" = true ] || [ ! -t 0 ]; then
+    if [ "$ASSUME_YES" = true ]; then
+        return 0
+    fi
+
+    if [ ! -t 0 ]; then
+        if [ -z "$TARGET_VERSION" ] && plan_crosses_into_2x; then
+            error "Refusing to cross into Appwrite 2.x unattended without an explicit choice"
+            subtle "Take a backup, then pass --version ${RESOLVED_TARGET_VERSION} or --yes."
+            exit 1
+        fi
         return 0
     fi
 
@@ -1482,14 +1631,89 @@ confirm_execution() {
 }
 
 # ---------- Upgrade / migration execution helpers ----------
+# Prints the host binding Traefik publishes for a container port, keeping any bound interface.
+published_port() {
+    local config="$1"
+    local target="$2"
+    local port
+
+    port="$(printf '%s' "$config" | jq -r --argjson target "$target" '
+        [.services.traefik.ports[]? | select(.target == $target and .published)
+            | if (.host_ip // "0.0.0.0") == "0.0.0.0" then "\(.published)" else "\(.host_ip):\(.published)" end]
+        | first // empty')"
+
+    printf '%s' "${port:-$target}"
+}
+
+load_published_ports() {
+    local config
+
+    if ! config="$(docker compose --project-directory "$APPWRITE_DIR" config --format json 2>/dev/null)" || \
+        ! printf '%s' "$config" | jq -e '.services' >/dev/null 2>&1; then
+        error "Could not read the published ports from docker compose config"
+        subtle "Run 'docker compose config' in ${APPWRITE_DIR} and fix what it reports. Upgrades would otherwise reset custom ports."
+        exit 1
+    fi
+
+    PUBLISHED_HTTP_PORT="$(published_port "$config" 80)"
+    PUBLISHED_HTTPS_PORT="$(published_port "$config" 443)"
+}
+
+# Reads the ports once before anything changes, and refuses a plan that could not keep them.
+prepare_upgrade_ports() {
+    local index version
+
+    for ((index = 0; index < ${#PLAN_VERSIONS[@]}; index++)); do
+        version="${PLAN_VERSIONS[$index]}"
+
+        if version_lt "$version" '1.9.0'; then
+            continue
+        fi
+
+        if [ -z "$PUBLISHED_HTTP_PORT" ]; then
+            load_published_ports
+        fi
+
+        if version_lt "$version" '2.5.0' && { [ "${#PUBLISHED_HTTP_PORT}" -gt 4 ] || [ "${#PUBLISHED_HTTPS_PORT}" -gt 4 ]; }; then
+            error "Appwrite ${version} cannot keep ports ${PUBLISHED_HTTP_PORT} and ${PUBLISHED_HTTPS_PORT}"
+            subtle "Its upgrade only accepts a plain port of up to 4 characters, published on all interfaces. Use a shorter port, and firewall it first if you rely on a bound interface."
+            exit 1
+        fi
+    done
+}
+
 upgrade_to_version() {
     local version="$1"
+    # Without this, 1.4 to 1.8 prompt before overwriting the compose file, and 1.9+ starts the
+    # web installer and blocks for up to 2 hours.
+    local -a upgrade_args=(--interactive=N)
+
+    # Before 2.5.0, a non-interactive upgrade from a 1.9+ compose file resets custom ports to 80/443.
+    if ! version_lt "$version" '1.9.0'; then
+        upgrade_args+=("--http-port=${PUBLISHED_HTTP_PORT}" "--https-port=${PUBLISHED_HTTPS_PORT}")
+    fi
+
     run_command "Upgrading Appwrite to ${version}" \
-        docker run -i --rm \
+        docker run --rm \
             --volume /var/run/docker.sock:/var/run/docker.sock \
             --volume "${APPWRITE_DIR}:/usr/src/code/appwrite:rw" \
             --entrypoint upgrade \
-            "appwrite/appwrite:${version}" <<< 'Y'
+            "appwrite/appwrite:${version}" "${upgrade_args[@]}"
+
+    warn_about_infrastructure_failures "$version"
+}
+
+# Appwrite still exits 0 when an infrastructure change fails, such as moving the builds volume.
+warn_about_infrastructure_failures() {
+    local version="$1"
+    local failures
+
+    failures="$(strip_ansi < "$LOG_FILE" | grep -E '" failed: |^Infrastructure changes from .* failed: |so none was copied' || true)"
+    if [ -n "$failures" ]; then
+        warn "Appwrite ${version} could not apply every infrastructure change"
+        subtle "$failures"
+        subtle "Check existing function and site deployments after the upgrade."
+    fi
 }
 
 remove_previous_image() {
@@ -1623,6 +1847,9 @@ preview_execution_plan() {
         echo
         printf '%bStep %d/%d%b  %s\n' "${BOLD}${WHITE}" "$((index + 1))" "$step_count" "${NC}" "$step_version"
 
+        if [ "$step_version" = "$PENDING_MIGRATION" ]; then
+            actions+=("Stop any interrupted migration")
+        fi
         actions+=("Upgrade Appwrite to ${step_version}")
         actions+=("Wait for Appwrite readiness")
         actions+=("Verify Appwrite runtime version ${step_version}")
@@ -1718,7 +1945,7 @@ preflight_16x_sync_iterator_runtime_patch() {
 <?php
 \$expectedVersion = '${expected_version}';
 \$file = '/usr/src/code/src/Appwrite/Migration/Migration.php';
-\$constantsFile = '/usr/src/code/app/init/constants.php';
+\$constantsFile = is_file('/usr/src/code/app/init/constants.php') ? '/usr/src/code/app/init/constants.php' : '/usr/src/code/app/init.php';
 \$backup = '${MIGRATION_RUNTIME_BACKUP_PATH}';
 
 \$knownOriginalHashes = [
@@ -1992,6 +2219,27 @@ print_16x_patch_warning() {
     subtle "Docs: ${runtime_patch_doc_url}"
 }
 
+print_pending_migration_warning() {
+    if [ -n "$PENDING_MIGRATION" ]; then
+        echo
+        warn "The ${PENDING_MIGRATION} migration did not finish in an earlier run. This plan runs it again first."
+    fi
+}
+
+print_2x_upgrade_warnings() {
+    if plan_crosses_into_2x; then
+        echo
+        warn "This plan crosses into Appwrite 2.x. Take a backup first: there is no way back without one."
+        subtle "2.x adds ClickHouse services, so check host memory and disk before upgrading."
+    fi
+
+    if version_lt "$CURRENT_VERSION" '2.2.0' && ! version_lt "$RESOLVED_TARGET_VERSION" '2.2.0'; then
+        echo
+        warn "From 2.2.0, executions stored only in the project database are no longer listed."
+        subtle "Function and site executions are read from ClickHouse, and the migration does not copy old ones."
+    fi
+}
+
 on_exit() {
     show_cursor
 }
@@ -2012,6 +2260,10 @@ on_interrupt() {
 
     ACTIVE_COMMAND_PID=''
     ACTIVE_COMMAND_DESCRIPTION=''
+    if [ "$MIGRATION_RUNNING" = true ]; then
+        warn "The migration may still be running inside the Appwrite container."
+        subtle "Run this updater again, or run 'docker compose restart appwrite', to stop it."
+    fi
     warn "Interrupted"
     exit 130
 }
@@ -2036,6 +2288,8 @@ main() {
     section "Preflight"
     load_migration_boundaries
     get_current_version
+    check_compose_project_name
+    load_pending_migration
 
     tree_line "Directory: $APPWRITE_DIR"
     tree_line "Current version: $CURRENT_VERSION"
@@ -2062,8 +2316,11 @@ main() {
     select_target_version
     validate_target_version
     build_plan
+    prepare_upgrade_ports
     print_plan
     print_16x_patch_warning
+    print_pending_migration_warning
+    print_2x_upgrade_warnings
 
     if [ "$DRY_RUN" = true ]; then
         preview_execution_plan
@@ -2100,8 +2357,15 @@ main() {
         echo
         printf '%bStep %d/%d%b  %s\n' "${BOLD}${WHITE}" "$((index + 1))" "$step_count" "${NC}" "$step_version"
 
+        if [ "$should_migrate" = 'yes' ]; then
+            record_pending_migration "$step_version"
+        fi
+
         action_index=$((action_index + 1))
         TREE_PREFIX="$(tree_prefix_for_index "$action_index" "$action_count")"
+        if [ "$step_version" = "$PENDING_MIGRATION" ]; then
+            stop_interrupted_migration
+        fi
         upgrade_to_version "$step_version"
         action_index=$((action_index + 1))
         TREE_PREFIX="$(tree_prefix_for_index "$action_index" "$action_count")"
@@ -2128,6 +2392,7 @@ main() {
             action_index=$((action_index + 1))
             TREE_PREFIX="$(tree_prefix_for_index "$action_index" "$action_count")"
             run_migration_command "$step_version"
+            clear_pending_migration
             performed_migration=true
 
             if step_requires_16x_runtime_patch "$step_version" "$should_migrate"; then
